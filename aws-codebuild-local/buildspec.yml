@@ -1,0 +1,9 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - env
+      - whoami
+      - echo Build started on `date`
+      - pwd

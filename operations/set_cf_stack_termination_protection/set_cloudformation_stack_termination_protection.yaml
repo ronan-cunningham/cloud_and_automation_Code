@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: SetCfStackTerminationProtection
+  EmailAddress:
+    Type: String
+  RetentionInDays: 
+    Type: Number
+    Default: 30
+
+Resources:
+
+#   _                            _           _          
+#  | |                          | |         | |         
+#  | |        __ _   _ __ ___   | |__     __| |   __ _  
+#  | |       / _` | | '_ ` _ \  | '_ \   / _` |  / _` | 
+#  | |____  | (_| | | | | | | | | |_) | | (_| | | (_| | 
+#  |______|  \__,_| |_| |_| |_| |_.__/   \__,_|  \__,_| 
+                                                      
+                                                      
+  StackTerminationProtectionFunctionLogGroup: 
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties: 
+      RetentionInDays: !Ref RetentionInDays
+      LogGroupName: !Sub /aws/lambda/${FunctionName}
+
+  StackTerminationProtectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          RETENTION_IN_DAYS: !Ref RetentionInDays
+      FunctionName: !Ref FunctionName
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import logging as log
+          from botocore.config import Config
+
+          regions=['eu-west-1','eu-west-2']
+          regions=['eu-west-2']
+
+          def get_client(region):
+
+              config = Config(
+                  region_name = region,
+                  retries = {
+                      'max_attempts': 5,
+                      'mode': 'standard'
+                  }
+              )
+              client = boto3.client('cloudformation',config=config)
+
+              return client
+
+          def get_stacks(cloudformation):
+
+              try:
+                  response = cloudformation.list_stacks(
+                      StackStatusFilter=[
+                          'CREATE_COMPLETE',
+                          'ROLLBACK_COMPLETE',
+                          'UPDATE_COMPLETE',
+                          'IMPORT_COMPLETE',
+                          'IMPORT_ROLLBACK_COMPLETE',
+                          'UPDATE_ROLLBACK_COMPLETE'
+                      ]
+                  )
+                  return response['StackSummaries']
+              except botocore.exceptions.ClientError as error:
+                  log.error("Failed to list stacks.")
+                  raise error
+              
+          def set_termination_protection(cloudformation,stack_name):
+              try:
+                  response=cloudformation.update_termination_protection(
+                      EnableTerminationProtection=True,
+                      StackName=stack_name
+                      )
+                  print("{} : Termination protection on.".format(stack_name))
+              except botocore.exceptions.ClientError as error:
+                  log.error("{} : Failed to update termination protection.".format(stack_name))
+
+          def handler(event, context):
+
+              for region in regions:
+
+                  print('Region {}:'.format(region))
+
+                  client=get_client(region)
+                  all_stacks=get_stacks(client)
+
+                  if all_stacks:
+                      non_nested_stacks=[x['StackName'] for x in all_stacks if 'ParentId' not in x]
+                      if non_nested_stacks:
+                          for stack_name in non_nested_stacks:
+                              set_termination_protection(client,stack_name)
+                          return {
+                              "statusCode": 200
+                          }
+                  log.info('No work to do')
+
+      Handler: index.handler
+      Runtime: python3.7
+      Role: !GetAtt StackTerminationProtectionFunctionExecutionRole.Arn
+
+  StackTerminationProtectionFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: UpdateLogGroups
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:ListStacks
+                  - cloudformation:UpdateTerminationProtection
+                Resource: "*"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+#    _____                        
+#   / ____|                       
+#  | |       _ __    ___    _ __  
+#  | |      | '__|  / _ \  | '_ \ 
+#  | |____  | |    | (_) | | | | |
+#   \_____| |_|     \___/  |_| |_|
+                                
+  StackTerminationProtectionFunctionRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: 'Runs Lambda to set log group retention'
+      ScheduleExpression: "cron(0 0 * * ? *)"  # Runs at midnight (00:00) every day
+      State: "ENABLED" 
+      Targets: 
+      - Arn: !GetAtt StackTerminationProtectionFunction.Arn
+        Id: "TargetFunctionV1"
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref FunctionName
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt StackTerminationProtectionFunctionRule.Arn
+
+#              _                 _     _                 
+#      /\     | |               | |   (_)                
+#     /  \    | |   ___   _ __  | |_   _   _ __     __ _ 
+#    / /\ \   | |  / _ \ | '__| | __| | | | '_ \   / _` |
+#   / ____ \  | | |  __/ | |    | |_  | | | | | | | (_| |
+#  /_/    \_\ |_|  \___| |_|     \__| |_| |_| |_|  \__, |
+#                                                   __/ |
+#                                                  |___/ 
+
+  LambdaAlarmSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+
+  LambdaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref LambdaAlarmSnsTopic
+      AlarmDescription: !Sub Invocation error for lambda ${FunctionName}
+      AlarmName: !Sub ${FunctionName}InvocationError
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      EvaluationPeriods: '1'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: '60'
+      Statistic: Sum
+      Threshold: '.5'
+      TreatMissingData: notBreaching

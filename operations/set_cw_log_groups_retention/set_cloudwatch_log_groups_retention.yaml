@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: SetCwlogGroupRetention
+  EmailAddress:
+    Type: String
+  RetentionInDays: 
+    Type: Number
+    Default: 30
+
+Resources:
+
+#   _                            _           _          
+#  | |                          | |         | |         
+#  | |        __ _   _ __ ___   | |__     __| |   __ _  
+#  | |       / _` | | '_ ` _ \  | '_ \   / _` |  / _` | 
+#  | |____  | (_| | | | | | | | | |_) | | (_| | | (_| | 
+#  |______|  \__,_| |_| |_| |_| |_.__/   \__,_|  \__,_| 
+                                                      
+                                                      
+  LogGroupRetentionFunctionLogGroup: 
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties: 
+      RetentionInDays: !Ref RetentionInDays
+      LogGroupName: !Sub /aws/lambda/${FunctionName}
+
+  LogGroupRetentionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          RETENTION_IN_DAYS: !Ref RetentionInDays
+      FunctionName: !Ref FunctionName
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import botocore
+          from botocore.config import Config
+
+          regions=['eu-west-1','eu-west-2']
+
+          def get_client(region):
+
+              config = Config(
+                  region_name = region,
+                  retries = {
+                      'max_attempts': 5,
+                      'mode': 'standard'
+                  }
+              )
+              client = boto3.client('logs',config=config)
+
+              return client
+
+          def get_all_log_groups(client):
+
+              args={}
+              response = client.describe_log_groups(**args)
+              results = response["logGroups"]
+              while "nextToken" in response:
+                  args['nextToken']=response["nextToken"]
+                  response = client.describe_log_groups(**args)
+                  results.extend(response["logGroups"])
+              return results
+
+          def get_retention_days(log_group_name):
+
+              '''
+              Use appropriate logic to determine the retention period you need.
+              CAUTION. Logs will be deleted.
+              '''
+
+              retention_days=os.getenv('RETENTION_IN_DAYS')
+              return int(retention_days)
+
+
+          def set_log_group_retention(log_group,days,client):
+
+              try:
+                  response = client.put_retention_policy(
+                      logGroupName=log_group,
+                      retentionInDays=days
+                  )
+                  print('Set {}:{}'.format(log_group,days))
+              except botocore.exceptions.ClientError as error:
+                  print(error)
+
+
+          def handler(event, context):
+
+              for region in regions:
+
+                  print('Region {}:'.format(region))
+                  cw_client=get_client(region)
+                  all_log_groups=get_all_log_groups(cw_client)
+                  print('{} log groups'.format(len(all_log_groups)))
+                  log_groups_with_no_retention=[x['logGroupName'] for x in all_log_groups if 'retentionInDays' not in x]
+                  
+                  if log_groups_with_no_retention:
+                      print('{} log groups without retention'.format(len(log_groups_with_no_retention)))
+                      for log_group in log_groups_with_no_retention:
+                          retention_days=get_retention_days(log_group)
+                          set_log_group_retention(log_group,retention_days,cw_client)
+                  else:
+                      print('{} log groups without retention - nothing to do'.format(len(log_groups_with_no_retention)))
+
+      Handler: index.handler
+      Runtime: python3.7
+      Role: !GetAtt LogGroupRetentionExecutionRole.Arn
+
+  LogGroupRetentionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: UpdateLogGroups
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ['logs:Describe*','logs:PutRetentionPolicy']
+                Resource: 'arn:aws:logs:*:*:*'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+#    _____                        
+#   / ____|                       
+#  | |       _ __    ___    _ __  
+#  | |      | '__|  / _ \  | '_ \ 
+#  | |____  | |    | (_) | | | | |
+#   \_____| |_|     \___/  |_| |_|
+                                
+  LogGroupRetentionRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: 'Runs Lambda to set log group retention'
+      ScheduleExpression: "cron(0 0 * * ? *)"  # Runs at midnight (00:00) every day
+      State: "ENABLED" 
+      Targets: 
+      - Arn: !GetAtt LogGroupRetentionFunction.Arn
+        Id: "TargetFunctionV1"
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref FunctionName
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt LogGroupRetentionRule.Arn
+
+#              _                 _     _                 
+#      /\     | |               | |   (_)                
+#     /  \    | |   ___   _ __  | |_   _   _ __     __ _ 
+#    / /\ \   | |  / _ \ | '__| | __| | | | '_ \   / _` |
+#   / ____ \  | | |  __/ | |    | |_  | | | | | | | (_| |
+#  /_/    \_\ |_|  \___| |_|     \__| |_| |_| |_|  \__, |
+#                                                   __/ |
+#                                                  |___/ 
+
+  LambdaAlarmSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+
+  LambdaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref LambdaAlarmSnsTopic
+      AlarmDescription: !Sub Invocation error for lambda ${FunctionName}
+      AlarmName: !Sub ${FunctionName}InvocationError
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      EvaluationPeriods: '1'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: '60'
+      Statistic: Sum
+      Threshold: '.5'
+      TreatMissingData: notBreaching
